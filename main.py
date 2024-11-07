@@ -1,5 +1,5 @@
 import os
-import requests
+import requests # type: ignore
 from urllib.parse import urlparse, urljoin
 
 def get_unique_filename(output_folder, filename):
