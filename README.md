@@ -1,20 +1,20 @@
-# Soop vod download
+# Soop clipped from vod download
 
 ## Introduction
 
-This project is a Python program that allows users to download `.ts` video segments from a `.m3u8` playlist URL from **https://www.sooplive.co.kr/**, combine them into a single video file, and clean up the temporary files afterward. This is particularly useful for handling media files from streaming services that deliver content as multiple small segments.
+This project is a Python program that allows users to clip and download `.m4s` video segments from a `.m3u8` playlist URL from **https://www.sooplive.co.kr/**, combine them into a single video file. This is particularly useful for handling media files from streaming services that deliver content as multiple small segments.
 
 ## How to Use
 
-This guide provides instructions on setting up the program for beginners, including installing Python, creating a virtual environment, and installing the necessary packages.
+This guide provides instructions on setting up the program for beginners, including installing Python, creating a virtual environment, and installing the necessary packages or you can JUST RUN IT because this only use common dependencies.
 
 ### Prerequisites
 
 1. **Python 3.7+**: Ensure you have Python installed on your system. You can download it from [Python's official website](https://www.python.org/downloads/).
 
-2. **FFmpeg**: The program uses FFmpeg to combine `.ts` files into a single video. Download and install FFmpeg from [FFmpeg's official website](https://ffmpeg.org/download.html).
+2. **FFmpeg**: The program uses FFmpeg to download edited m3u8
 
-3. **m3u8**: To find m3u8 files you should check by inspecting the website and check Network element or using add-on like hls downloader, remember to download soop vod m3u8
+3. **m3u8**: To find m3u8 url you can use browser add on and find something like this "https://vod-archive-global-cdn-z02.sooplive.co.kr/spkt/vod/..._1_.mp4/manifest.m3u8?cv=v1"
 
 ### Step-by-Step Setup
 

@@ -1,151 +1,220 @@
 import os
-import requests # type: ignore
-from urllib.parse import urlparse, urljoin
+import re
+import math
+import requests
+import subprocess
+from urllib.parse import urljoin, urlparse
 
-def get_unique_filename(output_folder, filename):
-    """
-    Check if the filename exists in the output folder.
-    If it does, add a unique number suffix to avoid overwriting.
-    """
-    base, extension = os.path.splitext(filename)
-    counter = 1
-    unique_filename = filename
-    
-    while os.path.exists(os.path.join(output_folder, unique_filename)):
-        unique_filename = f"{base}_{counter}{extension}"
-        counter += 1
-    
-    return unique_filename
+def hms_to_seconds(hms: str) -> float:
+    h, m, s = hms.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
 
-def download_m3u8_file(m3u8_url, folder):
-    # Create the folder if it doesn't exist
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+def is_absolute(u: str) -> bool:
+    return urlparse(u).scheme in ("http", "https")
 
-    # Get the filename from the URL
-    m3u8_filename = os.path.join(folder, m3u8_url.split('/')[-1])
+def make_absolute(base_url: str, u: str) -> str:
+    return u if is_absolute(u) else urljoin(base_url, u)
 
-    try:
-        print(f"Downloading .m3u8 file from {m3u8_url}...")
+def shorten_m3u8_by_time(m3u8_url: str, output_m3u8: str, start_hms: str, end_hms: str) -> dict:
+    print(f"\nDownloading m3u8 from {m3u8_url} ...")
+    r = requests.get(m3u8_url)
+    r.raise_for_status()
+    raw_lines = r.text.strip().splitlines()
 
-        # Send a GET request to download the .m3u8 file
-        response = requests.get(m3u8_url)
-        response.raise_for_status()
+    # Derive base URL from the m3u8 URL
+    base_url = m3u8_url.rsplit("/", 1)[0] + "/"
 
-        # Write the content to the .m3u8 file
-        with open(m3u8_filename, 'wb') as file:
-            file.write(response.content)
+    # Remove any TOTAL DURATION (underscore or hyphen; any casing)
+    total_dur_re = re.compile(r"#EXT-X-TOTAL[-_]DURATION", re.IGNORECASE)
+    lines = [ln.strip() for ln in raw_lines if not total_dur_re.match(ln.strip())]
 
-        print(f".m3u8 file saved as {m3u8_filename}")
-        return m3u8_filename
+    start_sec = hms_to_seconds(start_hms)
+    end_sec = hms_to_seconds(end_hms)
+    if end_sec <= start_sec:
+        raise ValueError("end time must be greater than start time")
 
-    except Exception as e:
-        print(f"Failed to download .m3u8 file: {e}")
-        return None
+    # Collect header-ish info seen before first EXTINF
+    saw_first_extinf = False
+    version_line = None
+    playlist_type_line = None
+    independent_line = None
+    original_targetduration = None
+    media_sequence_original = None
+    key_lines_abs = []      # keep keys (with absolute URI)
+    map_line_abs = None     # keep the first EXT-X-MAP (absolute)
 
-def extract_ts_urls_from_m3u8(m3u8_filename, base_url, output_txt):
-    try:
-        # Read the .m3u8 file to extract .ts URLs
-        ts_urls = []
-        with open(m3u8_filename, 'r') as file:
-            for line in file:
-                line = line.strip()
-                if line and line.endswith('.ts'):  # Look for .ts URLs
-                    # If the .ts URL is relative, join it with the base URL
-                    if not line.startswith('http'):
-                        full_url = urljoin(base_url, line)
-                    else:
-                        full_url = line
+    # Pass 1: scan & capture headers + build segment list
+    segments = []  # list of dicts: {dur, uri, raw_extinf, index_int or None}
+    current_time = 0.0
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
 
-                    ts_urls.append(full_url)
+        if not saw_first_extinf:
+            if ln.startswith("#EXT-X-VERSION"):
+                version_line = ln
+            elif ln.startswith("#EXT-X-PLAYLIST-TYPE"):
+                playlist_type_line = ln
+            elif ln.startswith("#EXT-X-INDEPENDENT-SEGMENTS"):
+                independent_line = ln
+            elif ln.startswith("#EXT-X-TARGETDURATION"):
+                try:
+                    original_targetduration = int(ln.split(":",1)[1].strip())
+                except Exception:
+                    pass
+            elif ln.startswith("#EXT-X-MEDIA-SEQUENCE"):
+                try:
+                    media_sequence_original = int(ln.split(":",1)[1].strip())
+                except Exception:
+                    pass
+            elif ln.startswith("#EXT-X-KEY"):
+                # Rewrite URI (if present) to absolute
+                m = re.search(r'URI="([^"]+)"', ln)
+                if m:
+                    abs_key = make_absolute(base_url, m.group(1))
+                    ln = re.sub(r'URI="[^"]+"', f'URI="{abs_key}"', ln)
+                key_lines_abs.append(ln)
+            elif ln.startswith("#EXT-X-MAP"):
+                # Rewrite map to absolute
+                m = re.search(r'URI="([^"]+)"', ln)
+                if m:
+                    abs_map = make_absolute(base_url, m.group(1))
+                    ln = re.sub(r'URI="[^"]+"', f'URI="{abs_map}"', ln)
+                # Keep the last seen map before first segment ( usually there’s only one )
+                map_line_abs = ln
 
-        # Save the .ts URLs to a .txt file
-        with open(output_txt, 'w') as txt_file:
-            for url in ts_urls:
-                txt_file.write(url + '\n')
+        if ln.startswith("#EXTINF"):
+            saw_first_extinf = True
+            # Duration
+            try:
+                dur = float(ln.split(":",1)[1].split(",")[0].strip())
+            except Exception:
+                dur = 0.0
+            # Next non-empty line should be the segment URI
+            if i + 1 >= len(lines):
+                break
+            uri_line = lines[i+1].strip()
+            # store
+            seg = {
+                "dur": dur,
+                "uri": uri_line,
+                "raw_extinf": ln,
+                "index": None
+            }
+            # Try to extract numeric index from filename (e.g., seg-123.m4s?cv=v1 -> 123)
+            mnum = re.search(r'(\d+)(?=[^0-9]*$)', uri_line)
+            if mnum:
+                try:
+                    seg["index"] = int(mnum.group(1))
+                except Exception:
+                    seg["index"] = None
 
-        print(f"Extracted {len(ts_urls)} .ts URLs and saved them to {output_txt}")
-        return ts_urls
+            segments.append(seg)
+            current_time += dur
+            i += 2
+            continue
 
-    except Exception as e:
-        print(f"Failed to extract .ts URLs: {e}")
-        return None
+        i += 1
 
-def get_base_url(m3u8_url):
-    parsed_url = urlparse(m3u8_url)
-    base_path = '/'.join(parsed_url.path.split('/')[:-1]) + '/'
-    return parsed_url.scheme + '://' + parsed_url.netloc + base_path
+    # Build time mapping to select by timestamp
+    selected = []
+    t_cursor = 0.0
+    for seg in segments:
+        seg_start = t_cursor
+        seg_end = t_cursor + seg["dur"]
+        # Select segment if it intersects [start_sec, end_sec]
+        if seg_end > start_sec and seg_start < end_sec:
+            selected.append(seg)
+        # Early break if we passed end
+        if seg_start >= end_sec:
+            break
+        t_cursor = seg_end
 
-def download_ts_files(ts_urls, folder):
-    os.makedirs(folder, exist_ok=True)
-    for url in ts_urls:
-        try:
-            filename = os.path.join(folder, os.path.basename(url))
-            print(f"Downloading {filename}...")
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
-            
-            with open(filename, 'wb') as file:
-                for chunk in response.iter_content(chunk_size=8192):
-                    file.write(chunk)
-            
-            print(f"Downloaded {filename} successfully.")
-        except Exception as e:
-            print(f"Failed to download {url}: {e}")
+    if not selected:
+        raise RuntimeError("No segments fall within the requested time range.")
 
-def create_ffmpeg_file_list(ts_urls, folder):
-    list_file_path = os.path.join(folder, "file_list.txt")
-    with open(list_file_path, 'w') as file:
-        for url in ts_urls:
-            # Extract only the local filename without the folder path
-            local_filename = os.path.basename(url)
-            file.write(f"file '{local_filename}'\n")
-    print(f"Created FFmpeg file list at {list_file_path}")
-    return list_file_path
+    # Recompute headers for the shortened list
+    # TargetDuration: integer ceil of the max segment duration in the selection
+    max_dur = max((s["dur"] for s in selected), default=0.0)
+    target_duration = int(math.ceil(max_dur)) if max_dur > 0 else (original_targetduration or 10)
 
-def combine_ts_files_ffmpeg(file_list_path, output_file):
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    os.system(f"ffmpeg -f concat -safe 0 -i \"{file_list_path}\" -c copy \"{output_file}\"")
-    print(f"Combined .ts files into {output_file}")
+    # MEDIA-SEQUENCE: use the index from first selected segment if available, else 0
+    if selected[0]["index"] is not None:
+        media_sequence = selected[0]["index"]
+    else:
+        # Fallback: keep original media sequence if present, otherwise 0
+        media_sequence = media_sequence_original if media_sequence_original is not None else 0
 
-def cleanup_ts_files(ts_folder):
-    for ts_file in os.listdir(ts_folder):
-        if ts_file.endswith('.ts'):
-            os.remove(os.path.join(ts_folder, ts_file))
-    print("All .ts files have been deleted.")
+    # Sum exact total duration of selected segments
+    total_duration = sum(s["dur"] for s in selected)
+
+    # Build the new playlist
+    out = []
+    out.append("#EXTM3U")
+    out.append(f"#EXT-X-VERSION:{(version_line.split(':',1)[1].strip() if version_line else '6')}")
+    if independent_line:
+        out.append(independent_line)
+    if playlist_type_line:
+        out.append(playlist_type_line)
+    out.append(f"#EXT-X-TARGETDURATION:{target_duration}")
+    out.append(f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}")
+    if key_lines_abs:
+        out.extend(key_lines_abs)
+    if map_line_abs:
+        out.append(map_line_abs)
+
+    # Write selected segments with absolute URLs
+    for s in selected:
+        out.append(s["raw_extinf"])
+        abs_uri = make_absolute(base_url, s["uri"])
+        out.append(abs_uri)
+
+    # Footer: ENDLIST then TOTAL_DURATION (underscore variant as you requested)
+    out.append("#EXT-X-ENDLIST")
+    out.append(f"#EXT-X-TOTAL_DURATION:{total_duration:.6f}")
+
+    # Save the shortened playlist
+    with open(output_m3u8, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+
+    print(f"\nShortened m3u8 saved to: {output_m3u8}")
+    print(f"Base URL (auto): {base_url}")
+    print(f"Selected duration: {total_duration:.3f}s  |  Segments: {len(selected)}  |  TARGETDURATION: {target_duration}")
+    return {
+        "output_m3u8": output_m3u8,
+        "duration": total_duration,
+        "segments": len(selected)
+    }
+
+def download_with_ffmpeg(local_m3u8: str, output_mp4: str):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-protocol_whitelist", "file,http,https,tcp,tls",
+        "-allowed_extensions", "ALL",
+        "-i", local_m3u8,
+        "-c", "copy",
+        output_mp4
+    ]
+    print(f"\nDownloading to {output_mp4} ...\n")
+    subprocess.run(cmd, check=True)
+    print(f"Download completed: {output_mp4}")
 
 if __name__ == "__main__":
+    try:
+        m3u8_url = input("Enter m3u8 URL: ").strip()
+        start_hms = input("Start time (HH:MM:SS): ").strip()
+        end_hms = input("End time   (HH:MM:SS): ").strip()
+        out_m3u8 = input("Output m3u8 filename (default: clipped.m3u8): ").strip() or "clipped.m3u8"
 
-    # Prompt user for m3u8 URL and output file name
-    m3u8_url = input("Enter the .m3u8 URL: ").strip()
-    output_file_name = input("Enter output file name (with extension, e.g., video.mp4): ").strip() or "combined_video.mp4"
-    
-    output_folder = "output_video"
-    temp_folder = "temp_files"
-    os.makedirs(output_folder, exist_ok=True)
-    os.makedirs(temp_folder, exist_ok=True)
-    
-    # Ensure unique output file name
-    output_file_name = get_unique_filename(output_folder, output_file_name)
-    
-    # Get base URL and download .m3u8 file
-    base_url = get_base_url(m3u8_url)
-    m3u8_file = download_m3u8_file(m3u8_url, temp_folder)
+        info = shorten_m3u8_by_time(m3u8_url, out_m3u8, start_hms, end_hms)
 
-    if m3u8_file:
-        # File to save the .ts URLs list
-        ts_urls_txt = os.path.join(temp_folder, "ts_urls_list.txt")
-
-        # Extract and save .ts URLs to the .txt file
-        ts_urls = extract_ts_urls_from_m3u8(m3u8_file, base_url, ts_urls_txt)
-
-        if ts_urls:
-            download_ts_files(ts_urls, temp_folder)
-
-            ffmpeg_file_list = create_ffmpeg_file_list(ts_urls, temp_folder)
-            
-            output_video_file = os.path.join(output_folder, output_file_name)
-            combine_ts_files_ffmpeg(ffmpeg_file_list, output_video_file)
-            
-            cleanup_ts_files(temp_folder)
-
+        choice = input("\nDownload now with ffmpeg? (y/N): ").strip().lower()
+        if choice == "y":
+            default_mp4 = os.path.splitext(os.path.basename(out_m3u8))[0] + ".mp4"
+            out_mp4 = input(f"Output MP4 filename (default: {default_mp4}): ").strip() or default_mp4
+            download_with_ffmpeg(out_m3u8, out_mp4)
+        else:
+            print("Skipping download.")
+    except Exception as e:
+        print(f"\nError: {e}")
