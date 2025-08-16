@@ -1,4 +1,4 @@
-# Soop clipped from vod download
+# Soop clipped download
 
 ## Introduction
 
@@ -24,8 +24,8 @@ Follow these steps to set up and run the project.
 
    Clone this repository to your local machine.
    ```bash
-   git clone https://github.com/GrosseMilchstrasse/soop-vod-dl.git
-   cd soop-vod-dl
+   git clone https://github.com/GrosseMilchstrasse/soop-clip-dl.git
+   cd soop-clip-dl
    ```
    Alternatively, you can download it as a ZIP file and extract it.
 
@@ -68,7 +68,7 @@ Follow these steps to set up and run the project.
         
    2. Enter your .m3u8 url when prompted:
 
-            Enter the .m3u8 URL: https://example.com/path/to/video.m3u8
+            Enter the .m3u8 URL: https://vod-archive-global-cdn-z02.sooplive.co.kr/spkt/vod/..._1_.mp4/manifest.m3u8?cv=v1
 
    3. The combined video file will be saved in the output directory, ready to play.
 
